@@ -2,7 +2,7 @@
 
 Python-based automation for turning a text script into a simple YouTube-ready narrated video using Kie API for media generation and `ffmpeg` for final rendering.
 
-This repo includes both:
+This repo includes both
 
 - a CLI for generating a full video from a script
 - a local FastAPI web app for browser-based uploads, generation, and job tracking
