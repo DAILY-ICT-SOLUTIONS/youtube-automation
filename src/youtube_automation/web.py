@@ -209,10 +209,14 @@ def _format_eta(seconds: float | None) -> str | None:
 
 
 def _job_clip_count(job_id: str) -> int:
+    return len(_scene_clip_paths(job_id))
+
+
+def _scene_clip_paths(job_id: str) -> list[Path]:
     assets_dir = _job_dir(job_id) / "assets"
     if not assets_dir.exists():
-        return 0
-    return len([path for path in assets_dir.glob("scene_*.mp4") if re.fullmatch(r"scene_\d+\.mp4", path.name)])
+        return []
+    return sorted(path for path in assets_dir.glob("scene_*.mp4") if re.fullmatch(r"scene_\d+\.mp4", path.name))
 
 
 def _preview_clip_path(scene_path: Path) -> Path:
@@ -368,6 +372,51 @@ def _clip_audio_output_path(job_id: str, title: str) -> Path:
     return _job_dir(job_id) / f"{slug}-clip-audio.mp4"
 
 
+def _clip_audio_status_path(job_id: str) -> Path:
+    return _job_dir(job_id) / "clip_audio_status.json"
+
+
+def _write_clip_audio_status(job_id: str, status: str, error: str | None = None) -> None:
+    path = _clip_audio_status_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "status": status,
+                "error": error,
+                "updated_at": _utc_now(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _read_clip_audio_status(job_id: str) -> dict[str, str | None]:
+    path = _clip_audio_status_path(job_id)
+    if not path.exists():
+        return {"status": "idle", "error": None, "updated_at": None}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"status": "idle", "error": None, "updated_at": None}
+    return {
+        "status": str(payload.get("status") or "idle"),
+        "error": payload.get("error"),
+        "updated_at": payload.get("updated_at"),
+    }
+
+
+def _clip_audio_status_is_fresh(status: dict[str, str | None]) -> bool:
+    updated_at = status.get("updated_at")
+    if not updated_at:
+        return False
+    parsed = _parse_iso_datetime(updated_at)
+    if not parsed:
+        return False
+    return (datetime.now(UTC) - parsed).total_seconds() < 1800
+
+
 def _job_clip_audio_url(job: JobRecord) -> str | None:
     path = _clip_audio_output_path(job.job_id, job.title)
     if not path.exists():
@@ -436,6 +485,7 @@ def _serialize_job(job: JobRecord) -> dict:
         "clip-audio",
         _clip_audio_output_path(job.job_id, job.title),
     )
+    payload["clip_audio_status"] = _read_clip_audio_status(job.job_id)
     return payload
 
 
@@ -557,12 +607,10 @@ def _unstick_job(background_tasks: BackgroundTasks, job_id: str) -> JobRecord:
 
 def _render_clip_audio_job(job_id: str) -> JobRecord:
     job = _get_job(job_id)
-    assets_dir = _job_dir(job_id) / "assets"
-    clip_paths = sorted(assets_dir.glob("scene_*.mp4"))
+    clip_paths = _scene_clip_paths(job_id)
     if not clip_paths:
         raise HTTPException(status_code=400, detail="No scene clips found for this job yet.")
 
-    settings = Settings.from_env()
     output_path = _clip_audio_output_path(job_id, job.title)
     render_video_from_clips_with_clip_audio(
         clip_paths=clip_paths,
@@ -572,6 +620,34 @@ def _render_clip_audio_job(job_id: str) -> JobRecord:
         fps=24,
     )
     return _get_job(job_id)
+
+
+def _run_clip_audio_job(job_id: str) -> None:
+    try:
+        _write_clip_audio_status(job_id, "rendering")
+        _render_clip_audio_job(job_id)
+        _write_clip_audio_status(job_id, "completed")
+    except Exception as exc:
+        _write_clip_audio_status(job_id, "failed", str(exc))
+
+
+def _start_clip_audio_job(background_tasks: BackgroundTasks, job_id: str) -> JobRecord:
+    job = _get_job(job_id)
+    output_path = _clip_audio_output_path(job_id, job.title)
+    if output_path.exists() and output_path.stat().st_size > 0:
+        _write_clip_audio_status(job_id, "completed")
+        return job
+
+    status = _read_clip_audio_status(job_id)
+    if status["status"] == "rendering" and _clip_audio_status_is_fresh(status):
+        return job
+
+    if not _scene_clip_paths(job_id):
+        raise HTTPException(status_code=400, detail="No scene clips found for this job yet.")
+
+    _write_clip_audio_status(job_id, "rendering")
+    background_tasks.add_task(_run_clip_audio_job, job_id)
+    return job
 
 
 def _render_voice_test(sample_text: str) -> dict[str, str]:
@@ -1137,6 +1213,7 @@ def home() -> str:
         previous.output_preview_url !== next.output_preview_url ||
         previous.clip_audio_output_url !== next.clip_audio_output_url ||
         previous.clip_audio_preview_url !== next.clip_audio_preview_url ||
+        JSON.stringify(previous.clip_audio_status || {{}}) !== JSON.stringify(next.clip_audio_status || {{}}) ||
         previous.progress_current !== next.progress_current ||
         previous.progress_total !== next.progress_total ||
         latestSceneUrl(previous) !== latestSceneUrl(next)
@@ -1156,6 +1233,8 @@ def home() -> str:
             Updated: ${{new Date(item.updated_at).toLocaleString()}}
             ${{item.error ? `<br>Error: ${{item.error}}` : ""}}
           </div>
+          ${{item.clip_audio_status && item.clip_audio_status.status === "rendering" ? `<div class="progress-text">Rendering clip-audio video...</div>` : ""}}
+          ${{item.clip_audio_status && item.clip_audio_status.status === "failed" ? `<div class="progress-text">Clip-audio failed: ${{item.clip_audio_status.error || "Unknown error"}}</div>` : ""}}
           ${{(item.status === "pending" || item.status === "rendering") ? `
             <div class="progress">
               <div class="progress-track">
@@ -1182,7 +1261,7 @@ def home() -> str:
           ` : ""}}
           ${{item.status === "failed" ? `<div><button class="secondary tiny" type="button" onclick="retryJob('${{item.job_id}}')">Retry</button></div>` : ""}}
           ${{item.status !== "completed" ? `<div><button class="secondary tiny" type="button" onclick="softenSceneJob('${{item.job_id}}')">Soften Blocked Scene</button></div>` : ""}}
-          ${{item.progress_current > 0 ? `<div><button class="secondary tiny" type="button" onclick="renderClipAudioJob('${{item.job_id}}')">Render Clip Audio</button></div>` : ""}}
+          ${{item.progress_current > 0 && (!item.clip_audio_status || item.clip_audio_status.status !== "rendering") ? `<div><button class="secondary tiny" type="button" onclick="renderClipAudioJob('${{item.job_id}}')">Render Clip Audio</button></div>` : ""}}
           ${{item.status !== "completed" ? `<div><button class="secondary tiny" type="button" onclick="unstickJob('${{item.job_id}}')">Unstick</button></div>` : ""}}
           ${{(item.status === "pending" || item.status === "rendering") ? `<div><button class="secondary tiny" type="button" onclick="cancelJob('${{item.job_id}}')">Cancel</button></div>` : ""}}
         </article>
@@ -1231,6 +1310,7 @@ def home() -> str:
       }}
 
       upsertJobCard(payload);
+      fetchJob(jobId);
     }}
 
     async function unstickJob(jobId) {{
@@ -1513,8 +1593,8 @@ def unstick_job(job_id: str, background_tasks: BackgroundTasks) -> dict:
 
 
 @app.post("/api/jobs/{job_id}/render-clip-audio")
-def render_clip_audio_job(job_id: str) -> dict:
-    return _serialize_job(_render_clip_audio_job(job_id))
+def render_clip_audio_job(job_id: str, background_tasks: BackgroundTasks) -> dict:
+    return _serialize_job(_start_clip_audio_job(background_tasks, job_id))
 
 
 @app.post("/api/jobs/{job_id}/soften-blocked-scene")

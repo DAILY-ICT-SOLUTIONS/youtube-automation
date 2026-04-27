@@ -8,8 +8,16 @@ import subprocess
 from .models import SceneAsset
 
 
-def run_command(args: list[str]) -> None:
-    completed = subprocess.run(args, check=False, capture_output=True, text=True)
+def run_command(args: list[str], timeout_seconds: int | None = None) -> None:
+    try:
+        completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "Command timed out:\n"
+            f"{shlex.join(args)}\n\n"
+            f"stdout:\n{exc.stdout or ''}\n\nstderr:\n{exc.stderr or ''}"
+        ) from exc
+
     if completed.returncode != 0:
         raise RuntimeError(
             "Command failed:\n"
@@ -237,6 +245,7 @@ def render_video_from_clips(
         run_command(
             [
                 "ffmpeg",
+                "-nostdin",
                 "-y",
                 "-i",
                 str(clip_path),
@@ -339,7 +348,8 @@ def render_video_from_clips_with_clip_audio(
                 "-ac",
                 "2",
                 str(normalized_path),
-            ]
+            ],
+            timeout_seconds=240,
         )
         normalized_paths.append(normalized_path)
 
@@ -350,6 +360,7 @@ def render_video_from_clips_with_clip_audio(
     run_command(
         [
             "ffmpeg",
+            "-nostdin",
             "-y",
             "-f",
             "concat",
@@ -360,7 +371,8 @@ def render_video_from_clips_with_clip_audio(
             "-c",
             "copy",
             str(output_path),
-        ]
+        ],
+        timeout_seconds=300,
     )
 
     return output_path
