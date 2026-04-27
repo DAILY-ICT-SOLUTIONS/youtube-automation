@@ -925,11 +925,24 @@ def home() -> str:
       font-size: 0.9rem;
     }}
     a.video-link {{
-      display: inline-block;
-      margin-top: 14px;
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
       color: var(--accent-dark);
       font-weight: 700;
       text-decoration: none;
+    }}
+    .video-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin-top: 14px;
+    }}
+    .download-link {{
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(203,90,46,0.12);
     }}
     .video-preview {{
       width: 100%;
@@ -1155,11 +1168,17 @@ def home() -> str:
           ${{renderScenePreview(item)}}
           ${{item.output_url ? `
             ${{item.output_preview_url ? `<video class="video-preview" controls preload="none" src="${{item.output_preview_url}}"></video>` : ""}}
-            <a class="video-link" href="${{item.output_url}}" target="_blank" rel="noreferrer">Open rendered video</a>
+            <div class="video-actions">
+              <a class="video-link" href="${{item.output_url}}" target="_blank" rel="noreferrer">Open rendered video</a>
+              <a class="video-link download-link" href="${{item.output_url}}" download>Download video</a>
+            </div>
           ` : ""}}
           ${{item.clip_audio_output_url ? `
             ${{item.clip_audio_preview_url ? `<video class="video-preview" controls preload="none" src="${{item.clip_audio_preview_url}}"></video>` : ""}}
-            <a class="video-link" href="${{item.clip_audio_output_url}}" target="_blank" rel="noreferrer">Open clip-audio video</a>
+            <div class="video-actions">
+              <a class="video-link" href="${{item.clip_audio_output_url}}" target="_blank" rel="noreferrer">Open clip-audio video</a>
+              <a class="video-link download-link" href="${{item.clip_audio_output_url}}" download>Download clip-audio video</a>
+            </div>
           ` : ""}}
           ${{item.status === "failed" ? `<div><button class="secondary tiny" type="button" onclick="retryJob('${{item.job_id}}')">Retry</button></div>` : ""}}
           ${{item.status !== "completed" ? `<div><button class="secondary tiny" type="button" onclick="softenSceneJob('${{item.job_id}}')">Soften Blocked Scene</button></div>` : ""}}
