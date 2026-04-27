@@ -37,6 +37,15 @@ class PlannerTests(unittest.TestCase):
         self.assertGreater(len(plan.scenes), 1)
         self.assertTrue(all(len(scene.narration.split()) <= MAX_WORDS_PER_SCENE for scene in plan.scenes))
 
+    def test_plan_adds_selected_african_character_direction(self) -> None:
+        plan = plan_from_script(
+            "# Demo\n\nA founder walks into a busy market.",
+            character="african_female_nigerian",
+        )
+
+        self.assertIn("adult African female lead", plan.scenes[0].visual_prompt)
+        self.assertIn("Nigerian styling cues", plan.scenes[0].visual_prompt)
+
     def test_build_scene_assets_covers_full_duration(self) -> None:
         assets = build_scene_assets(
             scene_image_paths=[Path("a.png"), Path("b.png")],

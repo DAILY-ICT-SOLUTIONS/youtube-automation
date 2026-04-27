@@ -19,6 +19,10 @@ This repo includes both
 - Renders a 1080p MP4 with `ffmpeg`
 - Includes a local FastAPI web app for browser-based uploads and job tracking
 - Includes a ChatGPT-powered script generator for turning a topic into a YouTube-ready script
+- Offers African character direction presets for Nigerian or pan-African male/female visual leads
+- Shows live scene previews while a render is still running
+- Shows browser-playable previews for completed rendered videos and clip-audio renders
+- Supports Kie callbacks through a public HTTPS tunnel such as Cloudflare Tunnel
 
 ## Project Layout
 
@@ -110,17 +114,68 @@ http://127.0.0.1:8000
 The browser UI lets you:
 
 - generate a script with ChatGPT from a topic and target word count
+- choose an African character direction for generated scripts and scene prompts
+- test the configured narration voice
 - paste a script
 - paste a YouTube reference video link
 - start a render job
-- watch job status live
-- open the finished MP4 in the browser
+- watch job status, scene count, progress, and ETA live
+- preview the latest completed scene while the full render is still running
+- preview completed rendered videos directly in the job card
+- render a clip-audio-only preview from available scene clips
+- retry, cancel, unstick, or soften blocked scene jobs from the browser
+- open the finished MP4 in a separate browser tab
+
+## Character Presets
+
+The web app includes visual character presets that influence both ChatGPT script generation and Kie/Veo scene prompts:
+
+- `Auto / Script-led`
+- `African Female - Nigerian`
+- `African Male - Nigerian`
+- `African Female - Pan-African`
+- `African Male - Pan-African`
+
+These presets guide the generated visual prompts. Narration still uses the Kie/ElevenLabs voice configured by `KIE_TTS_VOICE`.
+
+## Video Previews
+
+The web app exposes preview-friendly MP4s for browser playback:
+
+- live scene previews use `scene_XXX.preview.mp4` files generated with `ffmpeg -movflags +faststart`
+- completed render previews are served through `/api/jobs/{job_id}/preview/rendered`
+- clip-audio previews are served through `/api/jobs/{job_id}/preview/clip-audio`
+- original MP4 files remain available through the open-video links
+
+Preview files are generated runtime artifacts under `build/` and should not be committed.
+
+## Cloudflare Tunnel
+
+To expose the local web app with your own domain:
+
+1. Start the app on an unused local port, for example:
+
+```bash
+python3 -m youtube_automation.cli serve-web --host 127.0.0.1 --port 8017
+```
+
+2. In Cloudflare Tunnel, route your hostname to:
+
+```text
+http://127.0.0.1:8017
+```
+
+3. Set the callback URL in `.env`:
+
+```env
+KIE_CALLBACK_URL=https://your-public-domain/api/kie/callback
+```
 
 ## Veo Callbacks
 
 If you want Kie Veo 3.1 to push task results instead of relying only on polling:
 
-- expose your local app with a public HTTPS URL, for example using `ngrok`
+- expose your local app with a public HTTPS URL, for example using Cloudflare Tunnel or `ngrok`
 - set `KIE_CALLBACK_URL` to:
   - `https://your-public-domain/api/kie/callback`
 - restart the app so new Veo tasks include `callBackUrl`

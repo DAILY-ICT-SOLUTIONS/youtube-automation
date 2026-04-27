@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from openai import NotFoundError, OpenAI
 
+from .characters import character_profile
 from .config import Settings
 from .styles import style_prompt
 
@@ -23,12 +24,14 @@ class ScriptGenerator:
         target_words: int = 150,
         tone: str = "engaging",
         video_style: str = "cinematic",
+        character: str = "auto",
     ) -> str:
         clean_topic = topic.strip()
         if not clean_topic:
             raise ValueError("A topic is required to generate a script.")
 
         target_words = max(80, min(target_words, 5000))
+        profile = character_profile(character)
 
         prompt = (
             "Write a YouTube narration script that is optimized for low-cost short scene generation.\n"
@@ -36,6 +39,7 @@ class ScriptGenerator:
             f"Angle: {angle.strip() or 'Give the viewer a clear, compelling overview.'}\n"
             f"Tone: {tone.strip() or 'engaging'}\n"
             f"Preferred visual style: {style_prompt(video_style)}\n"
+            f"Character direction: {profile.script_direction}\n"
             f"Target word count: about {target_words} words\n\n"
             "Format requirements:\n"
             "1. Start with a single title line beginning with '# '.\n"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
+from .characters import character_profile, normalize_character_profile
 from .models import Scene, VideoPlan
 from .styles import normalize_style, style_prompt
 
@@ -80,20 +81,27 @@ def _rebalance_blocks(blocks: list[str]) -> list[str]:
     return merged_blocks
 
 
-def _build_visual_prompt(title: str, narration: str, video_style: str) -> str:
+def _build_visual_prompt(title: str, narration: str, video_style: str, character: str = "auto") -> str:
+    profile = character_profile(character)
+    character_direction = ""
+    if profile.key != "auto":
+        character_direction = f"Character direction: {profile.visual_direction} "
+
     return (
         f"High-quality short-form AI video scene about '{title}'. "
         f"Visual style: {style_prompt(video_style)}. "
+        f"{character_direction}"
         f"Scene content: {narration} "
         "Natural motion, clear subject, strong composition, expressive camera movement, "
         "high production value, clean frame, no text overlay, suitable for premium text-to-video generation."
     )
 
 
-def plan_from_script(script_text: str, video_style: str = "cinematic") -> VideoPlan:
+def plan_from_script(script_text: str, video_style: str = "cinematic", character: str = "auto") -> VideoPlan:
     lines = script_text.strip().splitlines()
     title = "Untitled Video"
     normalized_style = normalize_style(video_style)
+    normalized_character = normalize_character_profile(character)
 
     if lines and lines[0].lstrip().startswith("#"):
         title = lines[0].lstrip("#").strip() or title
@@ -122,7 +130,7 @@ def plan_from_script(script_text: str, video_style: str = "cinematic") -> VideoP
             Scene(
                 index=index,
                 narration=narration,
-                visual_prompt=_build_visual_prompt(title, narration, normalized_style),
+                visual_prompt=_build_visual_prompt(title, narration, normalized_style, normalized_character),
                 target_duration_seconds=TARGET_SCENE_DURATION_SECONDS,
             )
         )
@@ -135,5 +143,5 @@ def plan_from_script(script_text: str, video_style: str = "cinematic") -> VideoP
     )
 
 
-def plan_from_file(script_file: Path, video_style: str = "cinematic") -> VideoPlan:
-    return plan_from_script(script_file.read_text(encoding="utf-8"), video_style=video_style)
+def plan_from_file(script_file: Path, video_style: str = "cinematic", character: str = "auto") -> VideoPlan:
+    return plan_from_script(script_file.read_text(encoding="utf-8"), video_style=video_style, character=character)

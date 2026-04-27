@@ -9,12 +9,14 @@ import html
 import json
 import re
 import statistics
+import subprocess
 
 from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .characters import CHARACTER_PROFILES, normalize_character_profile
 from .config import Settings, load_dotenv
 from .ffmpeg import render_video_from_clips_with_clip_audio
 from .kie import KieClient, find_urls
@@ -42,6 +44,7 @@ class JobInput:
     script_text: str
     reference_url: str
     video_style: str = "cinematic"
+    character: str = "auto"
 
 
 class ScriptRequest(BaseModel):
@@ -50,6 +53,7 @@ class ScriptRequest(BaseModel):
     tone: str = "engaging"
     target_words: int = 150
     video_style: str = "cinematic"
+    character: str = "auto"
 
 
 class VoiceTestRequest(BaseModel):
@@ -125,6 +129,17 @@ def _job_output_url(video_path: Path) -> str:
     return f"/outputs/{relative.as_posix()}"
 
 
+def _cache_busted_output_url(video_path: Path) -> str:
+    return f"{_job_output_url(video_path)}?v={int(video_path.stat().st_mtime)}"
+
+
+def _path_from_output_url(output_url: str | None) -> Path | None:
+    if not output_url or not output_url.startswith("/outputs/"):
+        return None
+    relative_url = output_url.split("?", 1)[0].removeprefix("/outputs/")
+    return Path("build") / relative_url
+
+
 def _voice_test_dir() -> Path:
     path = Path("build/web/voice-tests")
     path.mkdir(parents=True, exist_ok=True)
@@ -195,7 +210,72 @@ def _format_eta(seconds: float | None) -> str | None:
 
 def _job_clip_count(job_id: str) -> int:
     assets_dir = _job_dir(job_id) / "assets"
-    return len(list(assets_dir.glob("scene_*.mp4"))) if assets_dir.exists() else 0
+    if not assets_dir.exists():
+        return 0
+    return len([path for path in assets_dir.glob("scene_*.mp4") if re.fullmatch(r"scene_\d+\.mp4", path.name)])
+
+
+def _preview_clip_path(scene_path: Path) -> Path:
+    return scene_path.with_name(f"{scene_path.stem}.preview.mp4")
+
+
+def _ensure_streamable_preview(video_path: Path) -> Path:
+    preview_path = _preview_clip_path(video_path)
+    if preview_path.exists() and preview_path.stat().st_mtime >= video_path.stat().st_mtime and preview_path.stat().st_size > 0:
+        return preview_path
+
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(preview_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"Could not prepare streamable preview for {video_path.name}: {completed.stderr.strip()}")
+    return preview_path
+
+
+def _streamable_preview_url(video_path: Path | None) -> str | None:
+    if not video_path or not video_path.exists() or video_path.stat().st_size <= 0:
+        return None
+    preview_path = _ensure_streamable_preview(video_path)
+    return _cache_busted_output_url(preview_path)
+
+
+def _preview_endpoint_url(job_id: str, kind: str, source_path: Path | None) -> str | None:
+    if not source_path or not source_path.exists() or source_path.stat().st_size <= 0:
+        return None
+    return f"/api/jobs/{job_id}/preview/{kind}?v={int(source_path.stat().st_mtime)}"
+
+
+def _job_scene_clip_urls(job_id: str) -> list[dict[str, object]]:
+    assets_dir = _job_dir(job_id) / "assets"
+    clips: list[dict[str, object]] = []
+    if not assets_dir.exists():
+        return clips
+
+    for path in sorted(assets_dir.glob("scene_*.mp4")):
+        if not path.exists() or path.stat().st_size <= 0:
+            continue
+        if not re.fullmatch(r"scene_\d+\.mp4", path.name):
+            continue
+        match = re.search(r"scene_(\d+)\.mp4$", path.name)
+        index = int(match.group(1)) if match else len(clips) + 1
+        preview_url = _streamable_preview_url(path)
+        if preview_url:
+            clips.append({"index": index, "url": preview_url})
+    return clips
 
 
 def _historical_scene_seconds(current_job_id: str) -> float | None:
@@ -348,7 +428,14 @@ def _update_task_metadata_from_callback(job_id: str, metadata_path: Path, payloa
 def _serialize_job(job: JobRecord) -> dict:
     payload = asdict(job)
     payload.update(_job_progress(job))
+    payload["scene_clip_urls"] = _job_scene_clip_urls(job.job_id)
+    payload["output_preview_url"] = _preview_endpoint_url(job.job_id, "rendered", _path_from_output_url(job.output_url))
     payload["clip_audio_output_url"] = _job_clip_audio_url(job)
+    payload["clip_audio_preview_url"] = _preview_endpoint_url(
+        job.job_id,
+        "clip-audio",
+        _clip_audio_output_path(job.job_id, job.title),
+    )
     return payload
 
 
@@ -358,10 +445,11 @@ def _run_job(
     reference_url: str,
     output_dir: Path,
     video_style: str = "cinematic",
+    character: str = "auto",
 ) -> None:
     try:
         settings = Settings.from_env()
-        plan = plan_from_script(script_text, video_style=video_style)
+        plan = plan_from_script(script_text, video_style=video_style, character=character)
         _update_job(job_id, status="rendering", title=plan.title, scene_count=len(plan.scenes))
 
         pipeline = VideoPipeline(settings)
@@ -387,6 +475,7 @@ def _retry_job(background_tasks: BackgroundTasks, job_id: str) -> JobRecord:
         job_input.reference_url,
         output_dir,
         job_input.video_style,
+        job_input.character,
     )
     return _get_job(job_id)
 
@@ -461,6 +550,7 @@ def _unstick_job(background_tasks: BackgroundTasks, job_id: str) -> JobRecord:
         job_input.reference_url,
         output_dir,
         job_input.video_style,
+        job_input.character,
     )
     return _get_job(job_id)
 
@@ -585,7 +675,7 @@ def _soften_blocked_scene_job(background_tasks: BackgroundTasks, job_id: str) ->
     if job.status == "completed" and job.output_url:
         raise HTTPException(status_code=400, detail="Completed jobs do not need blocked-scene softening.")
 
-    plan = plan_from_script(job_input.script_text, video_style=job_input.video_style)
+    plan = plan_from_script(job_input.script_text, video_style=job_input.video_style, character=job_input.character)
     next_scene_index: int | None = None
     for scene in plan.scenes:
         if not _scene_clip_path(job_id, scene.index).exists():
@@ -611,6 +701,7 @@ def _soften_blocked_scene_job(background_tasks: BackgroundTasks, job_id: str) ->
             script_text=rebuilt_script,
             reference_url=job_input.reference_url,
             video_style=job_input.video_style,
+            character=job_input.character,
         ),
     )
 
@@ -630,6 +721,7 @@ def _soften_blocked_scene_job(background_tasks: BackgroundTasks, job_id: str) ->
         job_input.reference_url,
         output_dir,
         job_input.video_style,
+        job_input.character,
     )
     return _get_job(job_id)
 
@@ -654,6 +746,10 @@ def home() -> str:
             ("documentary", "Documentary"),
             ("futuristic_3d", "Futuristic 3D"),
         ]
+    )
+    character_options = "\n".join(
+        f'<option value="{profile.key}">{profile.label}</option>'
+        for profile in CHARACTER_PROFILES.values()
     )
     return f"""<!doctype html>
 <html lang="en">
@@ -835,6 +931,39 @@ def home() -> str:
       font-weight: 700;
       text-decoration: none;
     }}
+    .video-preview {{
+      width: 100%;
+      margin-top: 14px;
+      border-radius: 16px;
+      background: rgba(24,32,40,0.08);
+      display: block;
+      aspect-ratio: 16 / 9;
+    }}
+    .scene-preview {{
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }}
+    .scene-links {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .scene-link {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 42px;
+      min-height: 34px;
+      padding: 8px 10px;
+      border-radius: 999px;
+      background: rgba(24,32,40,0.08);
+      color: var(--ink);
+      font-size: 0.86rem;
+      font-weight: 700;
+      text-decoration: none;
+    }}
     .empty {{
       color: var(--muted);
       font-style: italic;
@@ -897,6 +1026,12 @@ def home() -> str:
           </div>
           <div class="split">
             <label>
+              African character
+              <select id="character" name="character">
+                {character_options}
+              </select>
+            </label>
+            <label>
               Tone
               <select id="script_tone" name="script_tone">
                 <option value="engaging">Engaging</option>
@@ -957,6 +1092,44 @@ def home() -> str:
       jobsRoot.innerHTML = '<div class="card empty">No renders yet. Start one from the form on the left.</div>';
     }}
 
+    function renderScenePreview(item) {{
+      const clips = item.scene_clip_urls || [];
+      const latestClip = clips[clips.length - 1];
+      if (!latestClip || item.output_url) return "";
+
+      return `
+        <div class="scene-preview">
+          <div class="eyebrow">Live Scene Preview</div>
+          <video class="video-preview" controls muted preload="metadata" src="${{latestClip.url}}"></video>
+          <div class="progress-text">Latest rendered scene: ${{latestClip.index}}</div>
+          <div class="scene-links">
+            ${{clips.map((clip) => `<a class="scene-link" href="${{clip.url}}" target="_blank" rel="noreferrer">S${{clip.index}}</a>`).join("")}}
+          </div>
+        </div>
+      `;
+    }}
+
+    function latestSceneUrl(item) {{
+      const clips = item.scene_clip_urls || [];
+      return clips.length ? clips[clips.length - 1].url : "";
+    }}
+
+    function shouldRenderJob(previous, next) {{
+      if (!previous) return true;
+      return (
+        previous.status !== next.status ||
+        previous.title !== next.title ||
+        previous.error !== next.error ||
+        previous.output_url !== next.output_url ||
+        previous.output_preview_url !== next.output_preview_url ||
+        previous.clip_audio_output_url !== next.clip_audio_output_url ||
+        previous.clip_audio_preview_url !== next.clip_audio_preview_url ||
+        previous.progress_current !== next.progress_current ||
+        previous.progress_total !== next.progress_total ||
+        latestSceneUrl(previous) !== latestSceneUrl(next)
+      );
+    }}
+
     function upsertJobCard(job) {{
       jobs.set(job.job_id, job);
       const ordered = Array.from(jobs.values()).sort((a, b) => a.created_at < b.created_at ? 1 : -1);
@@ -979,8 +1152,15 @@ def home() -> str:
               ${{item.progress_eta_label ? `<div class="progress-text">Estimated time remaining: ${{item.progress_eta_label}}</div>` : ""}}
             </div>
           ` : ""}}
-          ${{item.output_url ? `<a class="video-link" href="${{item.output_url}}" target="_blank" rel="noreferrer">Open rendered video</a>` : ""}}
-          ${{item.clip_audio_output_url ? `<a class="video-link" href="${{item.clip_audio_output_url}}" target="_blank" rel="noreferrer">Open clip-audio video</a>` : ""}}
+          ${{renderScenePreview(item)}}
+          ${{item.output_url ? `
+            ${{item.output_preview_url ? `<video class="video-preview" controls preload="none" src="${{item.output_preview_url}}"></video>` : ""}}
+            <a class="video-link" href="${{item.output_url}}" target="_blank" rel="noreferrer">Open rendered video</a>
+          ` : ""}}
+          ${{item.clip_audio_output_url ? `
+            ${{item.clip_audio_preview_url ? `<video class="video-preview" controls preload="none" src="${{item.clip_audio_preview_url}}"></video>` : ""}}
+            <a class="video-link" href="${{item.clip_audio_output_url}}" target="_blank" rel="noreferrer">Open clip-audio video</a>
+          ` : ""}}
           ${{item.status === "failed" ? `<div><button class="secondary tiny" type="button" onclick="retryJob('${{item.job_id}}')">Retry</button></div>` : ""}}
           ${{item.status !== "completed" ? `<div><button class="secondary tiny" type="button" onclick="softenSceneJob('${{item.job_id}}')">Soften Blocked Scene</button></div>` : ""}}
           ${{item.progress_current > 0 ? `<div><button class="secondary tiny" type="button" onclick="renderClipAudioJob('${{item.job_id}}')">Render Clip Audio</button></div>` : ""}}
@@ -994,7 +1174,12 @@ def home() -> str:
       const response = await fetch(`/api/jobs/${{jobId}}`);
       if (!response.ok) return;
       const job = await response.json();
-      upsertJobCard(job);
+      const previous = jobs.get(job.job_id);
+      if (shouldRenderJob(previous, job)) {{
+        upsertJobCard(job);
+      }} else {{
+        jobs.set(job.job_id, job);
+      }}
       if (job.status === "pending" || job.status === "rendering") {{
         window.setTimeout(() => fetchJob(jobId), 4000);
       }}
@@ -1127,6 +1312,7 @@ def home() -> str:
       const angle = document.getElementById("script_angle").value.trim();
       const tone = document.getElementById("script_tone").value;
       const videoStyle = document.getElementById("video_style").value;
+      const character = document.getElementById("character").value;
       const targetWords = document.getElementById("target_words").value;
 
       if (!topic) {{
@@ -1145,7 +1331,8 @@ def home() -> str:
           angle,
           tone,
           target_words: Number(targetWords || 150),
-          video_style: videoStyle
+          video_style: videoStyle,
+          character
         }})
       }});
 
@@ -1201,6 +1388,7 @@ async def create_job(
     script_text: str = Form(...),
     reference_url: str = Form(...),
     video_style: str = Form("cinematic"),
+    character: str = Form("auto"),
 ) -> dict:
     if not script_text.strip():
         raise HTTPException(status_code=400, detail="Script text is required.")
@@ -1214,9 +1402,10 @@ async def create_job(
     output_dir = BASE_BUILD_DIR / job_id
 
     normalized_video_style = normalize_style(video_style)
+    normalized_character = normalize_character_profile(character)
 
     try:
-        plan = plan_from_script(script_text, video_style=normalized_video_style)
+        plan = plan_from_script(script_text, video_style=normalized_video_style, character=normalized_character)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1235,6 +1424,7 @@ async def create_job(
             script_text=script_text,
             reference_url=validated_reference_url,
             video_style=normalized_video_style,
+            character=normalized_character,
         ),
     )
     background_tasks.add_task(
@@ -1244,6 +1434,7 @@ async def create_job(
         validated_reference_url,
         output_dir,
         normalized_video_style,
+        normalized_character,
     )
     return asdict(job)
 
@@ -1268,6 +1459,23 @@ def list_jobs() -> dict:
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str) -> dict:
     return _serialize_job(_get_job(job_id))
+
+
+@app.get("/api/jobs/{job_id}/preview/{kind}")
+def preview_job_video(job_id: str, kind: str) -> FileResponse:
+    job = _get_job(job_id)
+    if kind == "rendered":
+        source_path = _path_from_output_url(job.output_url)
+    elif kind == "clip-audio":
+        source_path = _clip_audio_output_path(job.job_id, job.title)
+    else:
+        raise HTTPException(status_code=404, detail="Unknown preview type.")
+
+    if not source_path or not source_path.exists():
+        raise HTTPException(status_code=404, detail="Preview source video not found.")
+
+    preview_path = _ensure_streamable_preview(source_path)
+    return FileResponse(preview_path, media_type="video/mp4")
 
 
 @app.post("/api/jobs/{job_id}/retry")
@@ -1316,6 +1524,7 @@ def generate_script(payload: ScriptRequest) -> dict:
             target_words=payload.target_words,
             tone=payload.tone,
             video_style=payload.video_style,
+            character=payload.character,
         )
         return {"script": script}
     except ValueError as exc:
